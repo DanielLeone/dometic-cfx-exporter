@@ -1,7 +1,7 @@
 import json
+import os
 import signal
 import socket
-import traceback
 from threading import Event
 
 import time
@@ -42,7 +42,7 @@ def decode(value_type, value):
     if value_type == ddmDataTypes.INT16_DECICURRENT_VOLT:
         return int16_degrees_celsius(value[0], value[1])
 
-    print(f"Unknown value type {value_type=}")
+    # other types (strings, arrays, plain numbers) are not exported
 
 
 def record(value, topic):
@@ -60,20 +60,43 @@ def encode(payload):
 
 def sub(s, topic):
     d = encode([ddmActions.SUBSCRIBE] + topic["PARAM"])
-    print(f'sending {d}')
     s.sendall(d)
 
 
-def recv(s):
-    b = s.recv(1024)
-    d = json.loads(b.decode().splitlines()[0])
-    payload = d["ddmp"]
-    print(f'received payload: {payload[0]}')
-    return payload[0], payload[1:]
+class ProtocolError(Exception):
+    pass
+
+
+class Reader:
+    """Splits the TCP stream into \\r / \\n terminated JSON messages.
+
+    A single recv() can hold a partial message or several messages, so we
+    buffer instead of assuming one recv == one message.
+    """
+
+    def __init__(self, s):
+        self.s = s
+        self.buf = b""
+
+    def next(self):
+        while True:
+            ends = [i for i in (self.buf.find(b"\r"), self.buf.find(b"\n")) if i != -1]
+            if ends:
+                idx = min(ends)
+                line, self.buf = self.buf[:idx], self.buf[idx + 1:]
+                if not line.strip():
+                    continue
+                payload = json.loads(line.decode())["ddmp"]
+                return payload[0], payload[1:]
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise ConnectionError("fridge closed the connection")
+            self.buf += chunk
+            if len(self.buf) > 65536:
+                raise ProtocolError("no message terminator in 64KiB of data")
 
 
 def ack(s):
-    print("sending ack")
     d = encode([ddmActions.ACK])
     s.sendall(d)
 
@@ -439,32 +462,30 @@ def main():
     signal.signal(signal.SIGTERM, exit_gracefully)
     start_http_server(port=9000)
 
-    host = "192.168.68.76"
-    port = 13142
+    host = os.environ.get("CFX3_HOST", "192.168.68.76")
+    port = int(os.environ.get("CFX3_PORT", "13142"))
+
+    # Back off while the fridge is off / out of range instead of crashing and
+    # relying on the container runtime to restart us.
+    backoff = 5
+    max_backoff = 300
 
     while not event.is_set():
-        print('creating socket')
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(30)
         created_socket_count.inc()
         try:
-            print('connecting socket')
             s.connect((host, port))
+            reader = Reader(s)
 
-            print("waiting for first message")
-            code, _ = recv(s)
+            code, _ = reader.next()
             if code != ddmActions.NOP:
-                print('expected NOP packet first')
-                exit(1)
+                raise ProtocolError(f"expected NOP packet first, got {code}")
 
-            print('connected... sending ping')
             ping(s)
-            print('waiting for ack')
-            code, _ = recv(s)
+            code, _ = reader.next()
             if code != ddmActions.ACK:
-                print('expected ack back')
-                exit(1)
-            print('received ack... subscribing')
+                raise ProtocolError(f"expected ACK, got {code}")
 
             sub(s, ddmTopics.SUBSCRIBE_APP_DZ)
             sub(s, ddmTopics.BATTERY_VOLTAGE_LEVEL)
@@ -477,20 +498,16 @@ def main():
             sub(s, ddmTopics.COMPARTMENT_1_SET_TEMPERATURE)
             sub(s, ddmTopics.DC_CURRENT_HISTORY_HOUR)
 
-            print("subscribed to topics")
-
+            print(f"connected to {host}:{port} and subscribed", flush=True)
+            backoff = 5
             connected_at = time.time()
 
             while not event.is_set():
-                now = time.time()
-                connected_for = now - connected_at
-                print(f"has been connected for {connected_for} seconds")
-                one_hour = 60 * 60
-                if connected_for > one_hour:
-                    print("connected for over 1hr; forcing reconnect")
+                if time.time() - connected_at > 60 * 60:
+                    # periodic reconnect keeps the fridge's session fresh
                     break
 
-                code, payload = recv(s)
+                code, payload = reader.next()
 
                 if code == ddmActions.PING:
                     ack(s)
@@ -504,22 +521,18 @@ def main():
                     value_type, topic_name = get_value_type(topic)
                     decoded_value = decode(value_type, value)
                     record(decoded_value, topic_name)
-
-                    print(f"{topic_name=} {value_type=} {decoded_value=}")
-                    if not topic_name:
-                        print(f"unknown topic {topic=} {value=}")
         except TimeoutError as e:
-            print("caught timeout error, will retry")
-            traceback.print_exc()
             socket_timeouts_count.inc()
+            print(f"timeout talking to fridge: {e!r}; retrying in {backoff}s", flush=True)
+        except Exception as e:
+            # connection refused / no route to host / bad JSON / protocol
+            # surprises: log one line and reconnect rather than dying.
+            print(f"fridge connection error: {e!r}; retrying in {backoff}s", flush=True)
         finally:
-            print('closing socket')
             s.close()
-            # don't delay if we're been asked to exit
-            if not event.is_set():
-                delay = 5
-                print(f'sleeping for {delay} seconds before reconnection')
-                time.sleep(delay)
+        # Event.wait returns early on SIGTERM so shutdown stays fast.
+        event.wait(backoff)
+        backoff = min(backoff * 2, max_backoff)
 
 
 if __name__ == "__main__":
